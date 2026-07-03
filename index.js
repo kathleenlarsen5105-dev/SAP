@@ -4,6 +4,8 @@
 //    Dean Analytics frontend from a SEPARATE Supabase project.
 // ========================================================
 
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
