@@ -227,6 +227,182 @@ app.get('/api/report/college-absences', verifyApiKey, async (req, res) => {
     }
 });
 
+// ========================================================
+// 📚 Subject Catalog & Student Course Completion Endpoints
+// ✅ يُضاف هذا الكود داخل نفس ملف الباك إند الحالي
+//    (نفس الملف اللي فيه verifyApiKey و supabase client)
+// ========================================================
+
+// ضع هذا الكود بعد تعريف middleware الـ verifyApiKey مباشرة،
+// وقبل سطر: const PORT = process.env.PORT || 3000;
+
+// --------------------------------------------------------
+// 🧠 Helpers
+// --------------------------------------------------------
+function mapCatalogRow(row) {
+    return {
+        id: row.id,
+        college: row.college,
+        subjectName: row.subject_name,
+        category: row.category || null,
+        prerequisiteSubject: row.prerequisite_subject || null,
+        updatedAt: row.updated_at,
+    };
+}
+
+function mapCompletionRow(row) {
+    return {
+        id: row.id,
+        studentId: row.student_id,
+        studentName: row.student_name,
+        college: row.college,
+        subjectName: row.subject_name,
+        passed: row.passed === true,
+        updatedBy: row.updated_by || null,
+        updatedAt: row.updated_at,
+    };
+}
+
+// ========================================================
+// 📍 GET /api/subjects/catalog?college=NURS
+// بيرجع كل مواد الكلية اللي ليها تصنيف/متطلب سابق محفوظ
+// ========================================================
+app.get('/api/subjects/catalog', verifyApiKey, async (req, res) => {
+    try {
+        const { college } = req.query;
+        if (!college) return res.status(400).json({ error: 'college مطلوب' });
+
+        const { data, error } = await supabase
+            .from('subject_catalog')
+            .select('*')
+            .eq('college', college)
+            .order('subject_name', { ascending: true });
+        if (error) throw error;
+
+        res.status(200).json({ subjects: (data || []).map(mapCatalogRow) });
+    } catch (err) {
+        console.error('Get Catalog Error:', err.message);
+        res.status(500).json({ error: 'فشل جلب كتالوج المواد' });
+    }
+});
+
+// ========================================================
+// 📍 POST /api/subjects/catalog
+// body: { college, subjectName, category, prerequisiteSubject }
+// upsert لصف واحد (تصنيف / متطلب سابق لمادة معينة)
+// ========================================================
+app.post('/api/subjects/catalog', verifyApiKey, async (req, res) => {
+    try {
+        const { college, subjectName, category, prerequisiteSubject } = req.body;
+        if (!college || !subjectName) {
+            return res.status(400).json({ error: 'college و subjectName مطلوبين' });
+        }
+        if (prerequisiteSubject && prerequisiteSubject === subjectName) {
+            return res.status(400).json({ error: 'لا يمكن أن تكون المادة متطلبًا سابقًا لنفسها' });
+        }
+
+        const { data, error } = await supabase
+            .from('subject_catalog')
+            .upsert({
+                college,
+                subject_name: subjectName,
+                category: category || null,
+                prerequisite_subject: prerequisiteSubject || null,
+                updated_at: new Date().toISOString(),
+            }, { onConflict: 'college,subject_name' })
+            .select()
+            .single();
+        if (error) throw error;
+
+        res.status(200).json({ subject: mapCatalogRow(data) });
+    } catch (err) {
+        console.error('Upsert Catalog Error:', err.message);
+        res.status(500).json({ error: 'فشل حفظ بيانات المادة' });
+    }
+});
+
+// ========================================================
+// 📍 GET /api/subjects/completion?studentId=...&college=...
+// بيرجع حالة اجتياز الطالب لكل مواد كليته (اللي عليها سجل)
+// ========================================================
+app.get('/api/subjects/completion', verifyApiKey, async (req, res) => {
+    try {
+        const { studentId, college } = req.query;
+        if (!studentId || !college) {
+            return res.status(400).json({ error: 'studentId و college مطلوبين' });
+        }
+
+        const { data, error } = await supabase
+            .from('student_course_completion')
+            .select('*')
+            .eq('student_id', studentId)
+            .eq('college', college);
+        if (error) throw error;
+
+        res.status(200).json({ completions: (data || []).map(mapCompletionRow) });
+    } catch (err) {
+        console.error('Get Completion Error:', err.message);
+        res.status(500).json({ error: 'فشل جلب حالة الاجتياز' });
+    }
+});
+
+app.post('/api/subjects/completion', verifyApiKey, async (req, res) => {
+    try {
+        const { studentId, studentName, college, subjectName, passed, updatedBy } = req.body;
+        if (!studentId || !college || !subjectName) {
+            return res.status(400).json({ error: 'studentId و college و subjectName مطلوبين' });
+        }
+
+        if (passed === true) {
+            const { data: catalogRow, error: catalogErr } = await supabase
+                .from('subject_catalog')
+                .select('prerequisite_subject')
+                .eq('college', college)
+                .eq('subject_name', subjectName)
+                .maybeSingle();
+            if (catalogErr) throw catalogErr;
+
+            const prereq = catalogRow?.prerequisite_subject;
+            if (prereq) {
+                const { data: prereqRow, error: prereqErr } = await supabase
+                    .from('student_course_completion')
+                    .select('passed')
+                    .eq('student_id', studentId)
+                    .eq('college', college)
+                    .eq('subject_name', prereq)
+                    .maybeSingle();
+                if (prereqErr) throw prereqErr;
+
+                if (!prereqRow || prereqRow.passed !== true) {
+                    return res.status(409).json({
+                        error: `لا يمكن اجتياز "${subjectName}" — يجب اجتياز "${prereq}" أولاً`,
+                        prerequisiteSubject: prereq,
+                    });
+                }
+            }
+        }
+
+        const { data, error } = await supabase
+            .from('student_course_completion')
+            .upsert({
+                student_id: studentId,
+                student_name: studentName || null,
+                college,
+                subject_name: subjectName,
+                passed: passed === true,
+                updated_by: updatedBy || null,
+                updated_at: new Date().toISOString(),
+            }, { onConflict: 'student_id,subject_name,college' })
+            .select()
+            .single();
+        if (error) throw error;
+
+        res.status(200).json({ completion: mapCompletionRow(data) });
+    } catch (err) {
+        console.error('Upsert Completion Error:', err.message);
+        res.status(500).json({ error: 'فشل حفظ حالة الاجتياز' });
+    }
+});
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🏛️ Dean Reports Backend running on port ${PORT}`));
 
