@@ -99,15 +99,34 @@ function filterByDateRange(records, startDate, endDate) {
         return rd >= s && rd <= e;
     });
 }
+// ========================================================
+// 📦 Pagination Helper — يجيب كل الصفوف المطابقة بدون ما يعتمد
+// على limit() اللي ممكن يترفض جزئيًا حسب إعدادات المشروع.
+// بيسحب دفعات (batches) من PAGE_SIZE صف لحد ما يخلص.
+// ========================================================
+const PAGE_SIZE = 1000;
+
+async function fetchAllPaginated(table, columns, filters = []) {
+    let allRows = [];
+    let from = 0;
+    while (true) {
+        let query = supabase.from(table).select(columns).range(from, from + PAGE_SIZE - 1);
+        filters.forEach(f => { query = query.eq(f.column, f.value); });
+        const { data, error } = await query;
+        if (error) throw error;
+        if (!data || !data.length) break;
+        allRows = allRows.concat(data);
+        if (data.length < PAGE_SIZE) break;
+        from += PAGE_SIZE;
+    }
+    return allRows;
+}
+
+const ATTENDANCE_COLUMNS = 'student_id, student_name, subject_name, college, hall, target_group, group_name, session_date, attendance_time, status, doctor_uid, doctor_name, notes, is_unruly, is_uniform_violation, level, sis_code, segment_count, feedback_status, feedback_rating, is_suspicious, is_recovered';
 
 async function fetchByEq(column, value) {
-    const { data, error } = await supabase
-        .from('attendance_logs')
-        .select('*')
-        .eq(column, value)
-        .limit(5000);
-    if (error) throw error;
-    return (data || []).map(mapRecord);
+    const rows = await fetchAllPaginated('attendance_logs', ATTENDANCE_COLUMNS, [{ column, value }]);
+    return rows.map(mapRecord);
 }
 
 // ========================================================
@@ -138,13 +157,11 @@ app.get('/api/report/doctor', verifyApiKey, async (req, res) => {
         const { doctorName, startDate, endDate, college } = req.query;
         if (!doctorName) return res.status(400).json({ error: 'doctorName مطلوب' });
 
-        let query = supabase.from('attendance_logs').select('*').eq('doctor_name', doctorName).limit(5000);
-        if (college) query = query.eq('college', college);
+        const filters = [{ column: 'doctor_name', value: doctorName }];
+        if (college) filters.push({ column: 'college', value: college });
+        const rows = await fetchAllPaginated('attendance_logs', ATTENDANCE_COLUMNS, filters);
 
-        const { data, error } = await query;
-        if (error) throw error;
-
-        const all = (data || []).map(mapRecord);
+        const all = rows.map(mapRecord);
         const records = filterByDateRange(all, startDate, endDate);
 
         res.status(200).json({ records });
@@ -162,19 +179,25 @@ app.get('/api/report/doctorRatings', verifyApiKey, async (req, res) => {
     try {
         const { college } = req.query;
 
-        let query = supabase
+        let queryBuilder = supabase
             .from('attendance_logs')
             .select('doctor_uid, doctor_name, feedback_rating')
-            .gt('feedback_rating', 0)
-            .limit(20000);
+            .gt('feedback_rating', 0);
+        if (college) queryBuilder = queryBuilder.eq('college', college);
 
-        if (college) query = query.eq('college', college);
-
-        const { data, error } = await query;
-        if (error) throw error;
+        let ratingRows = [];
+        let from = 0;
+        while (true) {
+            const { data, error } = await queryBuilder.range(from, from + PAGE_SIZE - 1);
+            if (error) throw error;
+            if (!data || !data.length) break;
+            ratingRows = ratingRows.concat(data);
+            if (data.length < PAGE_SIZE) break;
+            from += PAGE_SIZE;
+        }
 
         const grouped = new Map();
-        (data || []).forEach(row => {
+        ratingRows.forEach(row => {
             const uid = row.doctor_uid;
             if (!uid) return;
             if (!grouped.has(uid)) {
@@ -204,6 +227,71 @@ app.get('/api/report/doctorRatings', verifyApiKey, async (req, res) => {
 });
 
 // ========================================================
+// 📍 GET /api/report/college-attendance
+// ?college=NURS — يرجّع ملخص حضور/غياب/انقطاع/مخالفات
+// لكل طالب في الكلية دفعة واحدة (بدل طلب منفصل لكل طالب)
+// ========================================================
+app.get('/api/report/college-attendance', verifyApiKey, async (req, res) => {
+    try {
+        const { college } = req.query;
+        if (!college) return res.status(400).json({ error: 'college مطلوب' });
+
+        const rows = await fetchAllPaginated(
+            'attendance_logs',
+            'student_id, status, session_date, doctor_name, subject_name, is_unruly',
+            [{ column: 'college', value: college }]
+        );
+
+        const grouped = new Map();
+        const todayStr = (() => {
+            const now = new Date();
+            const dd = String(now.getDate()).padStart(2, '0');
+            const mm = String(now.getMonth() + 1).padStart(2, '0');
+            const yyyy = now.getFullYear();
+            return `${dd}/${mm}/${yyyy}`;
+        })();
+
+        rows.forEach(row => {
+            const sid = row.student_id;
+            if (!sid) return;
+            if (!grouped.has(sid)) {
+                grouped.set(sid, { present: 0, absent: 0, lastDate: null, unrulyIncidents: [], todayUnrulyIncidents: [] });
+            }
+            const g = grouped.get(sid);
+            if (row.status === 'ATTENDED') g.present++;
+            if (row.status === 'ABSENT') g.absent++;
+
+            const dt = parseDMY(row.session_date);
+            if (dt && (!g.lastDate || dt > g.lastDate)) g.lastDate = dt;
+
+            if (row.is_unruly === true) {
+                const incident = { doctorName: row.doctor_name, subject: row.subject_name, date: row.session_date };
+                g.unrulyIncidents.push(incident);
+                if (row.session_date === todayStr) g.todayUnrulyIncidents.push(incident);
+            }
+        });
+
+        const summaries = {};
+        grouped.forEach((g, sid) => {
+            const gapDays = g.lastDate ? Math.floor((Date.now() - g.lastDate.getTime()) / (1000 * 60 * 60 * 24)) : null;
+            summaries[sid] = {
+                present: g.present,
+                absent: g.absent,
+                gapDays,
+                unrulyIncidents: g.unrulyIncidents,
+                unrulyCount: g.unrulyIncidents.length,
+                todayUnrulyIncidents: g.todayUnrulyIncidents
+            };
+        });
+
+        res.status(200).json({ summaries });
+    } catch (err) {
+        console.error('College Attendance Summary Error:', err.message);
+        res.status(500).json({ error: 'فشل جلب ملخص حضور الكلية من صبابيز' });
+    }
+});
+
+// ========================================================
 // 📍 GET /api/report/subject
 // ?subject=...&startDate=...&endDate=...&college=(اختياري)
 // ========================================================
@@ -212,13 +300,11 @@ app.get('/api/report/subject', verifyApiKey, async (req, res) => {
         const { subject, startDate, endDate, college } = req.query;
         if (!subject) return res.status(400).json({ error: 'subject مطلوب' });
 
-        let query = supabase.from('attendance_logs').select('*').eq('subject_name', subject).limit(5000);
-        if (college) query = query.eq('college', college);
+        const filters = [{ column: 'subject_name', value: subject }];
+        if (college) filters.push({ column: 'college', value: college });
+        const rows = await fetchAllPaginated('attendance_logs', ATTENDANCE_COLUMNS, filters);
 
-        const { data, error } = await query;
-        if (error) throw error;
-
-        const all = (data || []).map(mapRecord);
+        const all = rows.map(mapRecord);
         const records = filterByDateRange(all, startDate, endDate);
 
         res.status(200).json({ records });
@@ -258,15 +344,12 @@ app.get('/api/report/college-absences', verifyApiKey, async (req, res) => {
         const { college, startDate, endDate } = req.query;
         if (!college) return res.status(400).json({ error: 'college مطلوب' });
 
-        const { data, error } = await supabase
-            .from('attendance_logs')
-            .select('*')
-            .eq('college', college)
-            .eq('status', 'ABSENT')
-            .limit(5000);
-        if (error) throw error;
+        const rows = await fetchAllPaginated('attendance_logs', ATTENDANCE_COLUMNS, [
+            { column: 'college', value: college },
+            { column: 'status', value: 'ABSENT' }
+        ]);
 
-        const all = (data || []).map(mapRecord);
+        const all = rows.map(mapRecord);
         const records = filterByDateRange(all, startDate, endDate);
 
         res.status(200).json({ records });
@@ -276,18 +359,6 @@ app.get('/api/report/college-absences', verifyApiKey, async (req, res) => {
     }
 });
 
-// ========================================================
-// 📚 Subject Catalog & Student Course Completion Endpoints
-// ✅ يُضاف هذا الكود داخل نفس ملف الباك إند الحالي
-//    (نفس الملف اللي فيه verifyApiKey و supabase client)
-// ========================================================
-
-// ضع هذا الكود بعد تعريف middleware الـ verifyApiKey مباشرة،
-// وقبل سطر: const PORT = process.env.PORT || 3000;
-
-// --------------------------------------------------------
-// 🧠 Helpers
-// --------------------------------------------------------
 function mapCatalogRow(row) {
     return {
         id: row.id,
