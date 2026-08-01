@@ -155,6 +155,55 @@ app.get('/api/report/doctor', verifyApiKey, async (req, res) => {
 });
 
 // ========================================================
+// 📍 GET /api/report/doctorRatings
+// ?college=(اختياري) — متوسط تقييمات كل دكتور من feedback_rating
+// ========================================================
+app.get('/api/report/doctorRatings', verifyApiKey, async (req, res) => {
+    try {
+        const { college } = req.query;
+
+        let query = supabase
+            .from('attendance_logs')
+            .select('doctor_uid, doctor_name, feedback_rating')
+            .gt('feedback_rating', 0)
+            .limit(20000);
+
+        if (college) query = query.eq('college', college);
+
+        const { data, error } = await query;
+        if (error) throw error;
+
+        const grouped = new Map();
+        (data || []).forEach(row => {
+            const uid = row.doctor_uid;
+            if (!uid) return;
+            if (!grouped.has(uid)) {
+                grouped.set(uid, { doctorUID: uid, doctorName: row.doctor_name || '—', sum: 0, count: 0 });
+            }
+            const g = grouped.get(uid);
+            g.sum += Number(row.feedback_rating) || 0;
+            g.count += 1;
+        });
+
+        const ratings = Array.from(grouped.values()).map(g => {
+            const avg = g.count ? g.sum / g.count : 0;
+            return {
+                doctorUID: g.doctorUID,
+                doctorName: g.doctorName,
+                avgRating: Math.round(avg * 10) / 10,
+                ratingCount: g.count,
+                percentage: Math.round((avg / 5) * 100),
+            };
+        });
+
+        res.status(200).json({ ratings });
+    } catch (err) {
+        console.error('Doctor Ratings Report Error:', err.message);
+        res.status(500).json({ error: 'فشل جلب تقييمات الدكاترة من صبابيز' });
+    }
+});
+
+// ========================================================
 // 📍 GET /api/report/subject
 // ?subject=...&startDate=...&endDate=...&college=(اختياري)
 // ========================================================
