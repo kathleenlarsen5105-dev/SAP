@@ -11,9 +11,20 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const { createClient } = require('@supabase/supabase-js');
 
+const admin = require('firebase-admin');
+
+if (!admin.apps.length) {
+    admin.initializeApp({
+        credential: admin.credential.cert({
+            projectId: process.env.FIREBASE_PROJECT_ID,
+            clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+            privateKey: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+        }),
+    });
+}
+
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-const DEAN_API_KEY = process.env.DEAN_API_KEY || '';
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     console.error('❌ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars.');
@@ -21,36 +32,76 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+const ALLOWED_ORIGINS = [
+    "https://smart-attendance-pro-doctor.web.app",
+    "https://smart-attendance-pro-doctor.firebaseapp.com",
+    "https://smart-attendance-pro-sap.web.app",
+    "https://smart-attendance-pro-sap.firebaseapp.com",
+
+    "https://attendance-doctor.web.app",
+    "https://attendance-doctor.firebaseapp.com",
+
+    "https://attendance-system-pro-dbdf1.web.app",
+    "https://attendance-system-pro-dbdf1.firebaseapp.com",
+
+    "http://localhost:5000",
+    "http://127.0.0.1:5000",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
+    "http://localhost:5501",
+    "http://127.0.0.1:5501"
+];
+
 const app = express();
-app.use(cors({ origin: true }));
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    }
+}));
 app.use(bodyParser.json());
 
-// ========================================================
-// 🔐 API Key Middleware
-// كل الطلبات لازم تبعت الهيدر: x-api-key
-// ========================================================
-const verifyApiKey = (req, res, next) => {
-    const key = req.headers['x-api-key'];
-    if (!DEAN_API_KEY) {
-        console.warn('⚠️ DEAN_API_KEY not configured on server — rejecting all requests.');
-        return res.status(500).json({ error: 'Server not configured' });
+
+const verifyFirebaseToken = async (req, res, next) => {
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+    if (!token) {
+        return res.status(401).json({ error: 'Unauthorized — missing token' });
     }
-    if (!key || key !== DEAN_API_KEY) {
-        return res.status(401).json({ error: 'Unauthorized — missing or invalid API key' });
+
+    try {
+        const decoded = await admin.auth().verifyIdToken(token);
+
+        if (decoded.role !== 'dean' && decoded.role !== 'doctor') {
+            return res.status(403).json({ error: 'Forbidden — doctors and deans only' });
+        }
+
+        req.user = decoded;
+        next();
+    } catch (err) {
+        console.warn('Token verification failed:', err.message);
+        return res.status(401).json({ error: 'Unauthorized — invalid token' });
     }
-    next();
 };
+
+function enforceCollegeScope(req, res, requestedCollege) {
+    if (req.user.role === 'dean') return requestedCollege;
+    const doctorCollege = req.user.college;
+    if (requestedCollege && requestedCollege !== doctorCollege) {
+        res.status(403).json({ error: 'Forbidden — outside your college' });
+        return null;
+    }
+    return doctorCollege;
+}
 
 app.get('/', (req, res) => {
     res.status(200).send('🏛️ Dean Reports Backend (Supabase Reader) is Running');
 });
 
-// ========================================================
-// 🧠 Helpers
-// ========================================================
-
-// بيحول صف Supabase (attendance_logs) لنفس الشكل اللي الفرونت إند
-// شغال بيه حاليًا مع Firestore، عشان مفيش حاجة تتلمس في المعالجة هناك.
 function mapRecord(row) {
     return {
         id: row.student_id || '',
@@ -78,7 +129,6 @@ function mapRecord(row) {
     };
 }
 
-// session_date متخزنة كنص "DD/MM/YYYY" — بنحولها لـ Date للمقارنة
 function parseDMY(str) {
     if (!str) return null;
     const parts = String(str).split('/');
@@ -99,11 +149,7 @@ function filterByDateRange(records, startDate, endDate) {
         return rd >= s && rd <= e;
     });
 }
-// ========================================================
-// 📦 Pagination Helper — يجيب كل الصفوف المطابقة بدون ما يعتمد
-// على limit() اللي ممكن يترفض جزئيًا حسب إعدادات المشروع.
-// بيسحب دفعات (batches) من PAGE_SIZE صف لحد ما يخلص.
-// ========================================================
+
 const PAGE_SIZE = 1000;
 
 async function fetchAllPaginated(table, columns, filters = []) {
@@ -129,16 +175,17 @@ async function fetchByEq(column, value) {
     return rows.map(mapRecord);
 }
 
-// ========================================================
-// 📍 GET /api/report/student
-// ?studentId=...&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
-// ========================================================
-app.get('/api/report/student', verifyApiKey, async (req, res) => {
+app.get('/api/report/student', verifyFirebaseToken, async (req, res) => {
     try {
         const { studentId, startDate, endDate } = req.query;
         if (!studentId) return res.status(400).json({ error: 'studentId مطلوب' });
 
         const all = await fetchByEq('student_id', studentId);
+
+        if (req.user.role !== 'dean' && all.length && all[0].college !== req.user.college) {
+            return res.status(403).json({ error: 'Forbidden — outside your college' });
+        }
+
         const records = filterByDateRange(all, startDate, endDate);
 
         res.status(200).json({ records });
@@ -148,17 +195,17 @@ app.get('/api/report/student', verifyApiKey, async (req, res) => {
     }
 });
 
-// ========================================================
-// 📍 GET /api/report/doctor
-// ?doctorName=...&startDate=...&endDate=...&college=(اختياري)
-// ========================================================
-app.get('/api/report/doctor', verifyApiKey, async (req, res) => {
+
+app.get('/api/report/doctor', verifyFirebaseToken, async (req, res) => {
     try {
         const { doctorName, startDate, endDate, college } = req.query;
         if (!doctorName) return res.status(400).json({ error: 'doctorName مطلوب' });
 
+        const scopedCollege = enforceCollegeScope(req, res, college);
+        if (scopedCollege === null) return;
+
         const filters = [{ column: 'doctor_name', value: doctorName }];
-        if (college) filters.push({ column: 'college', value: college });
+        if (scopedCollege) filters.push({ column: 'college', value: scopedCollege });
         const rows = await fetchAllPaginated('attendance_logs', ATTENDANCE_COLUMNS, filters);
 
         const all = rows.map(mapRecord);
@@ -171,11 +218,7 @@ app.get('/api/report/doctor', verifyApiKey, async (req, res) => {
     }
 });
 
-// ========================================================
-// 📍 GET /api/report/doctorRatings
-// ?college=(اختياري) — متوسط تقييمات كل دكتور من feedback_rating
-// ========================================================
-app.get('/api/report/doctorRatings', verifyApiKey, async (req, res) => {
+app.get('/api/report/doctorRatings', verifyFirebaseToken, async (req, res) => {
     try {
         const { college } = req.query;
 
@@ -183,7 +226,9 @@ app.get('/api/report/doctorRatings', verifyApiKey, async (req, res) => {
             .from('attendance_logs')
             .select('doctor_uid, doctor_name, feedback_rating')
             .gt('feedback_rating', 0);
-        if (college) queryBuilder = queryBuilder.eq('college', college);
+        const scopedCollege = enforceCollegeScope(req, res, college);
+        if (scopedCollege === null) return;
+        if (scopedCollege) queryBuilder = queryBuilder.eq('college', scopedCollege);
 
         let ratingRows = [];
         let from = 0;
@@ -226,15 +271,11 @@ app.get('/api/report/doctorRatings', verifyApiKey, async (req, res) => {
     }
 });
 
-// ========================================================
-// 📍 GET /api/report/college-attendance
-// ?college=NURS — يرجّع ملخص حضور/غياب/انقطاع/مخالفات
-// لكل طالب في الكلية دفعة واحدة (بدل طلب منفصل لكل طالب)
-// ========================================================
-app.get('/api/report/college-attendance', verifyApiKey, async (req, res) => {
+app.get('/api/report/college-attendance', verifyFirebaseToken, async (req, res) => {
     try {
         const { college } = req.query;
         if (!college) return res.status(400).json({ error: 'college مطلوب' });
+        if (enforceCollegeScope(req, res, college) === null) return;
 
         const rows = await fetchAllPaginated(
             'attendance_logs',
@@ -290,18 +331,16 @@ app.get('/api/report/college-attendance', verifyApiKey, async (req, res) => {
         res.status(500).json({ error: 'فشل جلب ملخص حضور الكلية من صبابيز' });
     }
 });
-
-// ========================================================
-// 📍 GET /api/report/subject
-// ?subject=...&startDate=...&endDate=...&college=(اختياري)
-// ========================================================
-app.get('/api/report/subject', verifyApiKey, async (req, res) => {
+app.get('/api/report/subject', verifyFirebaseToken, async (req, res) => {
     try {
         const { subject, startDate, endDate, college } = req.query;
         if (!subject) return res.status(400).json({ error: 'subject مطلوب' });
 
+        const scopedCollege = enforceCollegeScope(req, res, college);
+        if (scopedCollege === null) return;
+
         const filters = [{ column: 'subject_name', value: subject }];
-        if (college) filters.push({ column: 'college', value: college });
+        if (scopedCollege) filters.push({ column: 'college', value: scopedCollege });
         const rows = await fetchAllPaginated('attendance_logs', ATTENDANCE_COLUMNS, filters);
 
         const all = rows.map(mapRecord);
@@ -314,14 +353,11 @@ app.get('/api/report/subject', verifyApiKey, async (req, res) => {
     }
 });
 
-// ========================================================
-// 📍 GET /api/report/college
-// ?college=...&startDate=...&endDate=...
-// ========================================================
-app.get('/api/report/college', verifyApiKey, async (req, res) => {
+app.get('/api/report/college', verifyFirebaseToken, async (req, res) => {
     try {
         const { college, startDate, endDate } = req.query;
         if (!college) return res.status(400).json({ error: 'college مطلوب' });
+        if (enforceCollegeScope(req, res, college) === null) return;
 
         const all = await fetchByEq('college', college);
         const records = filterByDateRange(all, startDate, endDate);
@@ -333,16 +369,11 @@ app.get('/api/report/college', verifyApiKey, async (req, res) => {
     }
 });
 
-// ========================================================
-// 📍 GET /api/report/college-absences
-// ?college=...&startDate=...&endDate=...
-// نفس endpoint الكلية بس بيرجع الغياب بس (الفلترة نفسها ممكن
-// تتعمل في الفرونت، لكن سيبناها هنا كمان توفيرًا لحجم البيانات)
-// ========================================================
-app.get('/api/report/college-absences', verifyApiKey, async (req, res) => {
+app.get('/api/report/college-absences', verifyFirebaseToken, async (req, res) => {
     try {
         const { college, startDate, endDate } = req.query;
         if (!college) return res.status(400).json({ error: 'college مطلوب' });
+        if (enforceCollegeScope(req, res, college) === null) return;
 
         const rows = await fetchAllPaginated('attendance_logs', ATTENDANCE_COLUMNS, [
             { column: 'college', value: college },
@@ -383,14 +414,11 @@ function mapCompletionRow(row) {
     };
 }
 
-// ========================================================
-// 📍 GET /api/subjects/catalog?college=NURS
-// بيرجع كل مواد الكلية اللي ليها تصنيف/متطلب سابق محفوظ
-// ========================================================
-app.get('/api/subjects/catalog', verifyApiKey, async (req, res) => {
+app.get('/api/subjects/catalog', verifyFirebaseToken, async (req, res) => {
     try {
         const { college } = req.query;
         if (!college) return res.status(400).json({ error: 'college مطلوب' });
+        if (enforceCollegeScope(req, res, college) === null) return;
 
         const { data, error } = await supabase
             .from('subject_catalog')
@@ -406,17 +434,13 @@ app.get('/api/subjects/catalog', verifyApiKey, async (req, res) => {
     }
 });
 
-// ========================================================
-// 📍 POST /api/subjects/catalog
-// body: { college, subjectName, category, prerequisiteSubject }
-// upsert لصف واحد (تصنيف / متطلب سابق لمادة معينة)
-// ========================================================
-app.post('/api/subjects/catalog', verifyApiKey, async (req, res) => {
+app.post('/api/subjects/catalog', verifyFirebaseToken, async (req, res) => {
     try {
         const { college, subjectName, category, prerequisiteSubject } = req.body;
         if (!college || !subjectName) {
             return res.status(400).json({ error: 'college و subjectName مطلوبين' });
         }
+        if (enforceCollegeScope(req, res, college) === null) return;
         if (prerequisiteSubject && prerequisiteSubject === subjectName) {
             return res.status(400).json({ error: 'لا يمكن أن تكون المادة متطلبًا سابقًا لنفسها' });
         }
@@ -441,16 +465,13 @@ app.post('/api/subjects/catalog', verifyApiKey, async (req, res) => {
     }
 });
 
-// ========================================================
-// 📍 GET /api/subjects/completion?studentId=...&college=...
-// بيرجع حالة اجتياز الطالب لكل مواد كليته (اللي عليها سجل)
-// ========================================================
-app.get('/api/subjects/completion', verifyApiKey, async (req, res) => {
+app.get('/api/subjects/completion', verifyFirebaseToken, async (req, res) => {
     try {
         const { studentId, college } = req.query;
         if (!studentId || !college) {
             return res.status(400).json({ error: 'studentId و college مطلوبين' });
         }
+        if (enforceCollegeScope(req, res, college) === null) return;
 
         const { data, error } = await supabase
             .from('student_course_completion')
@@ -466,12 +487,13 @@ app.get('/api/subjects/completion', verifyApiKey, async (req, res) => {
     }
 });
 
-app.post('/api/subjects/completion', verifyApiKey, async (req, res) => {
+app.post('/api/subjects/completion', verifyFirebaseToken, async (req, res) => {
     try {
         const { studentId, studentName, college, subjectName, passed, updatedBy } = req.body;
         if (!studentId || !college || !subjectName) {
             return res.status(400).json({ error: 'studentId و college و subjectName مطلوبين' });
         }
+        if (enforceCollegeScope(req, res, college) === null) return;
 
         if (passed === true) {
             const { data: catalogRow, error: catalogErr } = await supabase
