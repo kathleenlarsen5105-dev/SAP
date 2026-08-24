@@ -4,7 +4,7 @@
   "description": "Independent read-only backend that serves attendance reports from Supabase for the Dean Analytics system.",
   "main": "index.js",
   "engines": {
-    "node": "20.x"
+    "node": "22.x"
   },
   "scripts": {
     "start": "node index.js",
