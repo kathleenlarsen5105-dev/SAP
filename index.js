@@ -11,11 +11,12 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const { createClient } = require('@supabase/supabase-js');
 
-const admin = require('firebase-admin');
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
 
-if (!admin.apps.length) {
-    admin.initializeApp({
-        credential: admin.credential.cert({
+if (!getApps().length) {
+    initializeApp({
+        credential: cert({
             projectId: process.env.FIREBASE_PROJECT_ID,
             clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
             privateKey: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
@@ -23,6 +24,7 @@ if (!admin.apps.length) {
     });
 }
 
+const auth = getAuth();
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
@@ -74,7 +76,7 @@ const verifyFirebaseToken = async (req, res, next) => {
     }
 
     try {
-        const decoded = await admin.auth().verifyIdToken(token);
+        const decoded = await auth.verifyIdToken(token);
 
         if (decoded.role !== 'dean' && decoded.role !== 'doctor') {
             return res.status(403).json({ error: 'Forbidden — doctors and deans only' });
