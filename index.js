@@ -45,6 +45,8 @@ const ALLOWED_ORIGINS = [
 
     "https://attendance-system-pro-dbdf1.web.app",
     "https://attendance-system-pro-dbdf1.firebaseapp.com",
+     "https://attendance-dean.web.app",
+    "https://attendance-dean.firebaseapp.com",
 
     "http://localhost:5000",
     "http://127.0.0.1:5000",
